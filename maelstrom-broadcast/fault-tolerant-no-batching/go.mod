@@ -1,4 +1,4 @@
-module maelstrom-broadcast
+module fault-tolerant-no-batching
 
 go 1.20
 
