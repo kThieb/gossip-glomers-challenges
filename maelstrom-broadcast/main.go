@@ -3,51 +3,45 @@ package main
 import (
 	"encoding/json"
 	"log"
-	"math/rand"
 	"sync"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-var maxBatchSize = 10
-var batchInterval = 250 * time.Millisecond
+const maxBatchSize = 5
+const batchInterval = 250 * time.Millisecond
 
 type State struct {
-	sendNeighbors []string
-	messages      []any
-	seenMessages  map[any]struct{}
-	maxBatchSize  int
-	batch         []any
-	mu            *sync.Mutex
-	abortChannel  chan string
+	sendNeighbors              []string
+	messages                   []any
+	seenMessages               map[any]struct{}
+	maxBatchSize               int
+	batch                      []any
+	mu                         *sync.Mutex
+	abortChannel               chan string
+	circuitBreakersPerNeighbor map[string]func(thunk func(success *bool) error) func(success *bool) error
 }
 
 func NewState() *State {
 	return &State{
-		sendNeighbors: make([]string, 0),
-		messages:      make([]any, 0),
-		seenMessages:  make(map[any]struct{}),
-		batch:         make([]any, 0, maxBatchSize),
-		maxBatchSize:  maxBatchSize,
-		mu:            new(sync.Mutex),
-		abortChannel:  make(chan string),
+		sendNeighbors:              make([]string, 0),
+		messages:                   make([]any, 0),
+		seenMessages:               make(map[any]struct{}),
+		batch:                      make([]any, 0, maxBatchSize),
+		maxBatchSize:               maxBatchSize,
+		mu:                         &sync.Mutex{},
+		abortChannel:               make(chan string),
+		circuitBreakersPerNeighbor: make(map[string]func(thunk func(success *bool) error) func(success *bool) error),
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-/** Meant to be used in a goroutine. */
-func scheduleNext(n *maelstrom.Node, state *State) {
+/** Meant to be used in a goroutine */
+func tickerBatchRPC(n *maelstrom.Node, state *State) {
 	t := time.NewTicker(batchInterval)
 	for {
 		select {
-		// Abort if a request has been sent
+		// Abort if a request has been sent from the broadcast handler
 		case <-state.abortChannel:
 			t.Reset(batchInterval)
 
@@ -55,7 +49,12 @@ func scheduleNext(n *maelstrom.Node, state *State) {
 		case <-t.C:
 			state.mu.Lock()
 
-			// deepcopy state.batch to snapshot the state with the mutex locked
+			if len(state.batch) == 0 {
+				state.mu.Unlock()
+				continue
+			}
+
+			// deepcopy state.batch to snapshot the state. Do this with the mutex locked
 			currentBatch := make([]any, len(state.batch))
 			copy(currentBatch, state.batch)
 
@@ -68,38 +67,26 @@ func scheduleNext(n *maelstrom.Node, state *State) {
 			for _, neighbor := range state.sendNeighbors {
 				go sendBroadcastBatchWithRetries(n, neighbor, currentBatch)
 			}
-			t.Reset(batchInterval)
 		}
 	}
 }
 
 func sendBroadcastBatchWithRetries(n *maelstrom.Node, neighbor string, messageBatch []any) error {
-	rpcBody := make(map[string]any)
-	rpcBody["type"] = "broadcast"
-	rpcBody["message"] = messageBatch
-
-	acked := false
-
-	// Retry with capped exponential backoff and jitter
-	retryIn := 400
-	maxRetryIn := 10000
-	jitterConstant := 0.2
-
-	for !acked {
-		n.RPC(neighbor, rpcBody, func(msg maelstrom.Message) error {
-			acked = true
+	retryOptions := &RetryOptions{
+		firstRetryDelayMs: 400,
+		maxRetryDelayMs:   10_000,
+		jitterConstant:    0.2,
+	}
+	thunk := func(success *bool) error {
+		rpcBody := make(map[string]any)
+		rpcBody["type"] = "broadcast"
+		rpcBody["message"] = messageBatch
+		return n.RPC(neighbor, rpcBody, func(msg maelstrom.Message) error {
+			*success = true
 			return nil
 		})
-
-		randomMultiplier := 1 - jitterConstant*(rand.Float64()-0.5)
-		sleepFor := time.Duration(randomMultiplier * float64(retryIn))
-		time.Sleep(sleepFor * time.Millisecond)
-
-		retryIn = min(2*retryIn, maxRetryIn)
 	}
-
-	// Schedule
-	return nil
+	return WithRetryAsync(retryOptions, thunk)
 }
 
 func main() {
@@ -138,10 +125,8 @@ func main() {
 
 			// We will send the snapshotted batch so we clear the state.batch array while holding the mutex
 			if len(state.batch) >= state.maxBatchSize {
-				state.batch = make([]any, 0, 2)
+				state.batch = make([]any, 0, state.maxBatchSize)
 			}
-			log.Println("The currentBatch batch from broadcast is: ")
-			log.Println(currentBatch...)
 
 			state.mu.Unlock()
 
@@ -150,7 +135,6 @@ func main() {
 				// Stop the background batch sender
 				state.abortChannel <- "abort"
 
-				log.Println("WILL SEND THE RPC!!!")
 				for _, neighbor := range state.sendNeighbors {
 					// Send the snapshotted batch
 					go sendBroadcastBatchWithRetries(n, neighbor, currentBatch)
@@ -195,8 +179,6 @@ func main() {
 			if len(state.batch) >= state.maxBatchSize {
 				state.batch = make([]any, 0, 2)
 			}
-			log.Println("The currentBatch batch from broadcast_batch is: ")
-			log.Println(currentBatch...)
 
 			state.mu.Unlock()
 
@@ -239,6 +221,8 @@ func main() {
 			neighbor := nei.(string)
 			state.mu.Lock()
 			state.sendNeighbors = append(state.sendNeighbors, neighbor)
+			state.circuitBreakersPerNeighbor[neighbor] = CreateCircuitBreaker(
+				&CircuitBreakerOptions{resetTimeout: 30 * time.Second})
 			state.mu.Unlock()
 		}
 
@@ -247,7 +231,7 @@ func main() {
 		return n.Reply(msg, returnBody)
 	})
 
-	go scheduleNext(n, state)
+	go tickerBatchRPC(n, state)
 
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
